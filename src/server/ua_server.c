@@ -36,6 +36,32 @@
 #include "open62541/plugin/certificategroup_default.h"
 #endif
 
+typedef struct UA_ServerCallbackEntry {
+    ZIP_ENTRY(UA_ServerCallbackEntry) treeEntry;
+    UA_UInt64 id;
+    UA_ServerCallback callback;
+    void *data;
+    UA_Boolean once;
+    UA_Boolean executing;
+    UA_Boolean removed;
+} UA_ServerCallbackEntry;
+
+static enum ZIP_CMP
+compareCallbackId(const UA_UInt64 *a, const UA_UInt64 *b) {
+    if(*a == *b)
+        return ZIP_CMP_EQ;
+    return (*a < *b) ? ZIP_CMP_LESS : ZIP_CMP_MORE;
+}
+
+ZIP_FUNCTIONS(UA_ServerCallbackTree, UA_ServerCallbackEntry, treeEntry,
+              UA_UInt64, id, compareCallbackId)
+
+static void *
+freeCallbackEntry(void *context, UA_ServerCallbackEntry *entry) {
+    UA_free(entry);
+    return NULL;
+}
+
 #define STARTCHANNELID 1
 #define STARTTOKENID 1
 
@@ -443,6 +469,10 @@ UA_Server_delete(UA_Server *server) {
     /* Clean up the config */
     UA_ServerConfig_clear(&server->config);
 
+    /* Release adapter storage after the owned EventLoop has been cleared.
+     * An external EventLoop retains its existing timer ownership contract. */
+    ZIP_ITER(UA_ServerCallbackTree, &server->callbacks, freeCallbackEntry, NULL);
+
 #if UA_MULTITHREADING >= 100
     UA_LOCK_DESTROY(&server->serviceMutex);
 #endif
@@ -707,13 +737,62 @@ setServerShutdown(UA_Server *server) {
 /* Timed Callbacks */
 /*******************/
 
+/* The EventLoop invokes UA_Callback, whose first parameter is void*, not
+ * UA_Server*. Keep the original function pointer and call it through its type.
+ * Removal during execution defers freeing the adapter until the call returns. */
+static void
+serverTimerCallback(void *application, void *context) {
+    UA_Server *server = (UA_Server*)application;
+    UA_ServerCallbackEntry *entry = (UA_ServerCallbackEntry*)context;
+    lockServer(server);
+    entry->executing = true;
+    unlockServer(server);
+
+    entry->callback(server, entry->data);
+
+    lockServer(server);
+    entry->executing = false;
+    if(entry->removed)
+        UA_free(entry);
+    else if(entry->once)
+        removeCallback(server, entry->id);
+    unlockServer(server);
+}
+
+/* The server owns the adapter after registration. Failed registrations leave
+ * both the callback tree and the caller's callbackId unchanged. */
+static UA_StatusCode
+addServerCallback(UA_Server *server, UA_ServerCallback callback, void *data,
+                  UA_Double interval_ms, UA_DateTime *date,
+                  UA_TimerPolicy policy, UA_UInt64 *callbackId) {
+    UA_LOCK_ASSERT(&server->serviceMutex);
+    if(!callback)
+        return UA_STATUSCODE_BADINTERNALERROR;
+    UA_ServerCallbackEntry *entry =
+        (UA_ServerCallbackEntry*)UA_calloc(1, sizeof(UA_ServerCallbackEntry));
+    UA_CHECK_MEM(entry, return UA_STATUSCODE_BADOUTOFMEMORY);
+    entry->callback = callback;
+    entry->data = data;
+    entry->once = (policy == UA_TIMERPOLICY_ONCE);
+    UA_EventLoop *el = server->config.eventLoop;
+    UA_StatusCode res = el->addTimer(el, serverTimerCallback, server, entry,
+                                    interval_ms, date, policy, &entry->id);
+    if(res != UA_STATUSCODE_GOOD) {
+        UA_free(entry);
+        return res;
+    }
+    ZIP_INSERT(UA_ServerCallbackTree, &server->callbacks, entry);
+    if(callbackId)
+        *callbackId = entry->id;
+    return UA_STATUSCODE_GOOD;
+}
+
 UA_StatusCode
 UA_Server_addTimedCallback(UA_Server *server, UA_ServerCallback callback,
                            void *data, UA_DateTime date, UA_UInt64 *callbackId) {
     lockServer(server);
-    UA_EventLoop *el = server->config.eventLoop;
-    UA_StatusCode retval = el->addTimer(el, (UA_Callback)callback, server, data,
-                                        0.0, &date, UA_TIMERPOLICY_ONCE, callbackId);
+    UA_StatusCode retval = addServerCallback(server, callback, data, 0.0, &date,
+                                             UA_TIMERPOLICY_ONCE, callbackId);
     unlockServer(server);
     return retval;
 }
@@ -721,10 +800,8 @@ UA_Server_addTimedCallback(UA_Server *server, UA_ServerCallback callback,
 UA_StatusCode
 addRepeatedCallback(UA_Server *server, UA_ServerCallback callback,
                     void *data, UA_Double interval_ms, UA_UInt64 *callbackId) {
-    UA_LOCK_ASSERT(&server->serviceMutex);
-    UA_EventLoop *el = server->config.eventLoop;
-    return el->addTimer(el, (UA_Callback)callback, server, data, interval_ms, NULL,
-                        UA_TIMERPOLICY_CURRENTTIME, callbackId);
+    return addServerCallback(server, callback, data, interval_ms, NULL,
+                             UA_TIMERPOLICY_CURRENTTIME, callbackId);
 }
 
 UA_StatusCode
@@ -742,7 +819,15 @@ changeRepeatedCallbackInterval(UA_Server *server, UA_UInt64 callbackId,
                                UA_Double interval_ms) {
     UA_LOCK_ASSERT(&server->serviceMutex);
     UA_EventLoop *el = server->config.eventLoop;
-    return el->modifyTimer(el, callbackId, interval_ms, NULL, UA_TIMERPOLICY_CURRENTTIME);
+    UA_StatusCode res = el->modifyTimer(el, callbackId, interval_ms, NULL,
+                                       UA_TIMERPOLICY_CURRENTTIME);
+    if(res == UA_STATUSCODE_GOOD) {
+        UA_ServerCallbackEntry *entry =
+            ZIP_FIND(UA_ServerCallbackTree, &server->callbacks, &callbackId);
+        if(entry)
+            entry->once = false;
+    }
+    return res;
 }
 
 UA_StatusCode
@@ -759,6 +844,15 @@ removeCallback(UA_Server *server, UA_UInt64 callbackId) {
     UA_LOCK_ASSERT(&server->serviceMutex);
     UA_EventLoop *el = server->config.eventLoop;
     el->removeTimer(el, callbackId);
+    UA_ServerCallbackEntry *entry =
+        ZIP_FIND(UA_ServerCallbackTree, &server->callbacks, &callbackId);
+    if(!entry)
+        return;
+    ZIP_REMOVE(UA_ServerCallbackTree, &server->callbacks, entry);
+    if(entry->executing)
+        entry->removed = true;
+    else
+        UA_free(entry);
 }
 
 void

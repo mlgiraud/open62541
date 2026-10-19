@@ -124,6 +124,10 @@ typedef struct {
 
 #endif
 
+/* Server-owned adapters retain the public callback type until invocation. */
+struct UA_ServerCallbackEntry;
+typedef ZIP_HEAD(UA_ServerCallbackTree, UA_ServerCallbackEntry) UA_ServerCallbackTree;
+
 struct UA_Server {
     /* Config */
     UA_ServerConfig config;
@@ -135,6 +139,7 @@ struct UA_Server {
 
     UA_LifecycleState state;
     UA_UInt64 houseKeepingCallbackId;
+    UA_ServerCallbackTree callbacks;
 
     /* List of registered drivers. The internally created drivers furthermore
      * have direct pointers for fast access below. */

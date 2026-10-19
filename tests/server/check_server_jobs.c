@@ -113,6 +113,128 @@ START_TEST(Server_removeCallback_unknown) {
 }
 END_TEST
 
+/* Verify the typed callback arguments as well as timer and context lifetimes. */
+typedef struct {
+    UA_Server *server;
+    UA_UInt64 id;
+    unsigned calls;
+} CallbackContext;
+
+static void
+countCallback(UA_Server *serverPtr, void *data) {
+    CallbackContext *ctx = (CallbackContext*)data;
+    ck_assert_ptr_eq(serverPtr, ctx->server);
+    ctx->calls++;
+}
+
+START_TEST(Server_timedCallbackExecutesOnce) {
+    CallbackContext ctx = {server, 0, 0};
+    UA_DateTime date = UA_DateTime_now_fake(NULL) + 10 * UA_DATETIME_MSEC;
+    ck_assert_uint_eq(UA_Server_addTimedCallback(server, countCallback, &ctx,
+                                                date, &ctx.id), UA_STATUSCODE_GOOD);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 1);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 1);
+    UA_Server_removeCallback(server, ctx.id);
+}
+END_TEST
+
+static void
+rescheduleCallback(UA_Server *serverPtr, void *data) {
+    CallbackContext *ctx = (CallbackContext*)data;
+    countCallback(serverPtr, data);
+    if(ctx->calls == 1) {
+        ck_assert_uint_eq(UA_Server_changeRepeatedCallbackInterval(serverPtr, ctx->id, 10),
+                          UA_STATUSCODE_GOOD);
+    } else {
+        UA_Server_removeCallback(serverPtr, ctx->id);
+        UA_Server_removeCallback(serverPtr, ctx->id);
+    }
+}
+
+START_TEST(Server_timedCallbackReschedulesItself) {
+    CallbackContext ctx = {server, 0, 0};
+    ck_assert_uint_eq(UA_Server_addTimedCallback(server, rescheduleCallback, &ctx,
+                                                UA_DateTime_now_fake(NULL), &ctx.id),
+                      UA_STATUSCODE_GOOD);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 1);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 2);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 2);
+}
+END_TEST
+
+static void
+removeTimedCallback(UA_Server *serverPtr, void *data) {
+    CallbackContext *ctx = (CallbackContext*)data;
+    countCallback(serverPtr, data);
+    UA_Server_removeCallback(serverPtr, ctx->id);
+}
+
+START_TEST(Server_timedCallbackRemovesItself) {
+    CallbackContext ctx = {server, 0, 0};
+    ck_assert_uint_eq(UA_Server_addTimedCallback(server, removeTimedCallback, &ctx,
+                                                UA_DateTime_now_fake(NULL), &ctx.id),
+                      UA_STATUSCODE_GOOD);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 1);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 1);
+}
+END_TEST
+
+START_TEST(Server_repeatedCallbackPassesContext) {
+    CallbackContext ctx = {server, 0, 0};
+    ck_assert_uint_eq(UA_Server_addRepeatedCallback(server, countCallback, &ctx, 10,
+                                                   &ctx.id), UA_STATUSCODE_GOOD);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 2);
+    UA_Server_removeCallback(server, ctx.id);
+    UA_fakeSleep(15);
+    UA_Server_run_iterate(server, false);
+    ck_assert_uint_eq(ctx.calls, 2);
+}
+END_TEST
+
+START_TEST(Server_callbackInvalidArguments) {
+    ck_assert_uint_eq(UA_Server_addRepeatedCallback(server, NULL, NULL, 10, NULL),
+                      UA_STATUSCODE_BADINTERNALERROR);
+    ck_assert_uint_eq(UA_Server_addTimedCallback(server, NULL, NULL,
+                                                UA_DateTime_now_fake(NULL), NULL),
+                      UA_STATUSCODE_BADINTERNALERROR);
+    ck_assert_uint_eq(UA_Server_addRepeatedCallback(server, countCallback, NULL, 0, NULL),
+                      UA_STATUSCODE_BADINTERNALERROR);
+}
+END_TEST
+
+static void
+pendingCallback(UA_Server *serverPtr, void *data) {
+    ck_abort_msg("Pending callback must not execute during fixture cleanup");
+}
+
+START_TEST(Server_deletePendingCallbackAdapters) {
+    /* The fixture deletes its owned EventLoop with these timers still pending.
+     * LeakSanitizer also checks that the callback adapters are released. */
+    ck_assert_uint_eq(UA_Server_addRepeatedCallback(server, pendingCallback, NULL,
+                                                   10000, NULL), UA_STATUSCODE_GOOD);
+    ck_assert_uint_eq(UA_Server_addTimedCallback(server, pendingCallback, NULL,
+                                                UA_DateTime_now_fake(NULL) +
+                                                10000 * UA_DATETIME_MSEC, NULL),
+                      UA_STATUSCODE_GOOD);
+}
+END_TEST
+
 static Suite* testSuite_Client(void) {
     Suite *s = suite_create("Server Callbacks");
     TCase *tc_server = tcase_create("Server Repeated Callbacks");
@@ -121,10 +243,16 @@ static Suite* testSuite_Client(void) {
     tcase_add_test(tc_server, Server_repeatedCallbackRemoveItself);
     tcase_add_test(tc_server, Server_changeRepeatedCallbackInterval);
     tcase_add_test(tc_server, Server_removeCallback_unknown);
+    tcase_add_test(tc_server, Server_repeatedCallbackPassesContext);
+    tcase_add_test(tc_server, Server_callbackInvalidArguments);
+    tcase_add_test(tc_server, Server_deletePendingCallbackAdapters);
     suite_add_tcase(s, tc_server);
     TCase *tc_timed = tcase_create("Server Timed Callbacks");
     tcase_add_checked_fixture(tc_timed, setup, teardown);
     tcase_add_test(tc_timed, Server_addTimedCallback_smoke);
+    tcase_add_test(tc_timed, Server_timedCallbackExecutesOnce);
+    tcase_add_test(tc_timed, Server_timedCallbackReschedulesItself);
+    tcase_add_test(tc_timed, Server_timedCallbackRemovesItself);
     suite_add_tcase(s, tc_timed);
     return s;
 }
